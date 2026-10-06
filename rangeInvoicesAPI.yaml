@@ -1,0 +1,378 @@
+openapi.yaml
+Файл опубликован из консоли Aether Coder
+
+openapi: 3.0.3
+
+info:
+  title: Оранж — подача счетов в 1С:Документооборот
+  version: "1.0.0"
+  description: |
+    Создание карточки счёта в 1С:Документооборот, прикрепление PDF и запуск
+    существующего процесса согласования.
+
+    Правила работы:
+      * external_id обязателен и уникален. Повторный вызов с тем же external_id
+        не создаёт второй счёт, а возвращает ранее созданный (status=existing).
+      * Организация и поставщик ищутся по ИНН и КПП. Новые контрагенты
+        не создаются: если не найден или найдено несколько — возвращается ошибка.
+      * Строки КБС приходят снаружи. 1С проверяет только полноту строки
+        (код, счёт затрат, подразделение, сумма) и равенство суммы строк сумме счёта.
+        Соответствие кода месячному бюджету проверяется до вызова.
+      * budget_snapshot — трассировка: месяц выгрузки и SHA-256 файла, из которого
+        взяты коды. Записывается в журнал интеграции.
+      * PDF передаётся в поле file_base64.
+
+servers:
+  - url: https://ЗАМЕНИТЬ-НА-АДРЕС-1С/БАЗА/hs/orange-invoices
+    description: Рабочий сервер публикации 1С
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  /v1/invoices/{filename}:
+    post:
+      operationId: submitInvoice
+      summary: Подать счёт на согласование
+      description: |
+        Создаёт карточку счёта, прикладывает PDF и запускает согласование
+        по схеме, заданной в карточке организации.
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          description: |
+            Имя будущего файла в карточке без расширения. Если в имени нет слова
+            "Счет", оно будет добавлено автоматически — этого требует проверка
+            вложений при согласовании.
+          schema:
+            type: string
+            example: Счет 10069 Мобильные технологии
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceRequest'
+      responses:
+        '201':
+          description: Счёт создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '200':
+          description: Счёт с таким external_id уже подавался ранее
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '207':
+          description: |
+            Счёт создан и файл приложен, но процесс согласования не запустился.
+            Повторный вызов с тем же external_id безопасен.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '400':
+          description: Некорректный запрос
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Неверный или отсутствующий токен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Найдено несколько поставщиков с таким ИНН
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Размер PDF превышает лимит
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '415':
+          description: Переданные данные не являются PDF
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Бизнес-ошибка: не найдена организация или поставщик, не найден
+            инициатор, неполная строка КБС, сумма строк не сходится.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Внутренняя ошибка сервиса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/status/{external_id}:
+    get:
+      operationId: getInvoiceStatus
+      summary: Состояние ранее поданного счёта
+      description: |
+        Возвращает ссылки на созданный счёт, файл и процесс согласования
+        по внешнему ключу. Используется для проверки результата и перед повтором.
+      parameters:
+        - name: external_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: mail-58810-attachment-0
+      responses:
+        '200':
+          description: Счёт найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '401':
+          description: Неверный или отсутствующий токен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Счёт с таким external_id не подавался
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+
+    InvoiceRequest:
+      type: object
+      required:
+        - external_id
+        - organization
+        - supplier
+        - invoice_number
+        - invoice_date
+        - amount
+        - title
+        - invoice_kind
+        - initiator
+        - budget_snapshot
+        - budget_lines
+        - file_base64
+      properties:
+        external_id:
+          type: string
+          maxLength: 200
+          description: Уникальный ключ подачи. Повтор не создаёт дубль.
+          example: mail-58810-attachment-0
+        organization:
+          $ref: '#/components/schemas/Party'
+        supplier:
+          $ref: '#/components/schemas/Party'
+        invoice_number:
+          type: string
+          description: Номер счёта поставщика
+          example: "10069"
+        invoice_date:
+          type: string
+          format: date
+          description: Дата счёта, ГГГГ-ММ-ДД
+          example: "2026-09-15"
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          description: Сумма счёта. Должна равняться сумме строк budget_lines.
+          example: 4200.00
+        currency:
+          type: string
+          description: Код валюты, по умолчанию 643 (рубль)
+          default: "643"
+          example: "643"
+        title:
+          type: string
+          maxLength: 150
+          description: |
+            Краткое назначение платежа. Не должно содержать слова "Счет"/"Счёт"
+            и символ №: это проверяется и на форме карточки.
+          example: Мобильное приложение
+        description:
+          type: string
+          description: Подробное содержание, попадает в поле "Содержание" карточки
+        invoice_kind:
+          type: string
+          enum: [services, inventory, goods_for_sale]
+          description: |
+            services — услуги, inventory — ТМЦ, goods_for_sale — товары к продаже.
+            Для inventory в карточке дополнительно требуются контактное лицо,
+            тип доставки, клуб, бюджетодержатель и МОЛ.
+          example: services
+        initiator:
+          type: string
+          description: |
+            Наименование пользователя 1С, от имени которого подаётся счёт.
+            Должен входить в белый список настроек интеграции.
+          example: Иризелян Дмитрий Сергеевич
+        budget_snapshot:
+          $ref: '#/components/schemas/BudgetSnapshot'
+        budget_lines:
+          type: array
+          minItems: 1
+          description: Строки КБС. Счёт может распределяться на несколько строк.
+          items:
+            $ref: '#/components/schemas/BudgetLine'
+        start_approval:
+          type: boolean
+          default: true
+          description: Запускать ли процесс согласования сразу после создания
+        file_base64:
+          type: string
+          format: byte
+          description: Исходный PDF счёта в base64
+
+    Party:
+      type: object
+      required: [inn]
+      properties:
+        inn:
+          type: string
+          description: ИНН, поиск точный
+          example: "2310035522"
+        kpp:
+          type: string
+          description: КПП, уточняет поиск при совпадении ИНН
+          example: "231001001"
+
+    BudgetSnapshot:
+      type: object
+      required: [month, file_hash]
+      description: |
+        Трассировка происхождения кодов КБС. Не валидируется, записывается
+        в журнал интеграции вместе со ссылками на созданные объекты.
+      properties:
+        month:
+          type: string
+          pattern: '^\d{4}-\d{2}$'
+          description: Бюджетный период выгрузки
+          example: "2026-09"
+        file_hash:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: SHA-256 файла месячной выгрузки бюджета
+          example: sha256:093ad6da629d3272911c79f5f703d8f1ffe41f1c5a33dbcc04fe84e15f2610d0
+
+    BudgetLine:
+      type: object
+      required: [line_code, cost_account, department, amount]
+      properties:
+        line_code:
+          type: string
+          maxLength: 20
+          description: Код строки месячного бюджета
+          example: "414419"
+        cost_account:
+          type: string
+          description: Счёт затрат, попадает в колонку "Статья"
+          example: 08.4 сторонние спец-ты
+        department:
+          type: string
+          description: |
+            Подразделение бюджета. Допустимые значения соответствуют
+            перечислению в 1С: Фитнес Краснодар 1/2/3, ЦЕНТРфит,
+            Центр Управление, Детский центр.
+          example: ЦЕНТРфит
+        description:
+          type: string
+          description: Расшифровка строки бюджета, справочное поле
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          example: 4200.00
+
+    InvoiceResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [created, approval_started, partial, existing]
+        document_number:
+          type: string
+          example: "10069"
+        document_ref:
+          type: string
+          description: Идентификатор карточки счёта в 1С
+        document_url:
+          type: string
+          description: Навигационная ссылка на карточку
+        file_attached:
+          type: boolean
+        approval_started:
+          type: boolean
+        process_ref:
+          type: string
+          description: Идентификатор процесса согласования
+        error:
+          type: string
+          description: Код ошибки при status=partial
+        error_detail:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [error]
+        error:
+          type: string
+          enum:
+            - unauthorized
+            - method_not_allowed
+            - invalid_json
+            - invalid_multipart
+            - invalid_file_base64
+            - missing_external_id
+            - invalid_external_id
+            - invalid_budget_snapshot
+            - missing_required_field
+            - missing_file
+            - invalid_amount
+            - invalid_date
+            - invalid_invoice_kind
+            - validation_failed
+            - amount_mismatch
+            - organization_not_found
+            - organization_ambiguous
+            - supplier_not_found
+            - supplier_ambiguous
+            - currency_not_found
+            - initiator_not_found
+            - file_rejected
+            - file_too_large
+            - not_found
+            - creation_failed
+            - internal_error
+        message:
+          type: string
+          description: Человекочитаемое пояснение
